@@ -29,7 +29,7 @@ GP2Mem is a memory editing tool for the classic racing game *Geoff Crammond’s 
 > Note: Use Python 3.10 or above
 1. Clone the repo:
 ```code
-git clone https://github.com/ilya_ssh/GP2Mem.git
+git clone https://github.com/ilya-ssh/GP2Mem.git
 cd GP2Mem
 ```
 
