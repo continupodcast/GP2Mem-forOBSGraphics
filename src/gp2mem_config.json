@@ -1,0 +1,37 @@
+{
+  "process": "x86GP2_inline.exe",
+  "base_anchor": "0x00F8CE60",
+  "anchor_struct_offset": "0x14",
+  "record_size": "0x330",
+  "refresh_ms": 56,
+  "sort_mode": "RacePos (0xA4)",
+  "scripts": {
+    "safety_car": {
+      "tick_ms": "50.0",
+      "base_kph": "60.0",
+      "min_kph": "40.0",
+      "max_kph": "80.0",
+      "gap_segments": "500.0",
+      "gain_kph_per_seg": "0.2",
+      "speed_units_per_kph": "48.0",
+      "order": "track",
+      "freeze_fuel": true,
+      "free_run_enabled": true,
+      "free_run_gap": "800.0",
+      "include_player": true,
+      "ignore_pits": true,
+      "ignore_invisible": true,
+      "ignore_failflags": false,
+      "ignore_invalid_racepos": true
+    },
+    "slipstream": {
+      "enabled": true,
+      "same_lap_only": true,
+      "require_same_side": true,
+      "min_kph": "100.0",
+      "range_seg": "2500.0",
+      "engine_mult": "1.01",
+      "hold_ms": "300.0"
+    }
+  }
+}
