@@ -17,6 +17,11 @@ import pymem.process
 import pymem.memory
 
 from const import *
+
+# Session clock: base_anchor + this offset = address of session elapsed timer (ms, u32)
+# Freezes when game or emulator is paused — perfect for lap time calculation.
+SESSION_CLOCK_OFFSET = 0x6C24
+
 from helpers import (
     ordinal,
     fmt_bits_u8,
@@ -31,6 +36,11 @@ from helpers import (
     enum_display_list,
     enum_value_from_display,
 )
+
+def fmt_time32_plain(v):
+    # Converts raw time32 intro a string 'm:ss.mmm'
+    s = fmt_time32(v)
+    return s.split(" (")[0] if s else None
 
 # ----------------------------
 # Native message boxes (Windows)
@@ -1091,6 +1101,11 @@ class CustomScriptsController:
         self._slip_until_tick: Dict[int, int] = {}
         self._eng_orig: Dict[int, int] = {}
 
+        # fuel drain state
+        self.fuel_drain_targets: List[int] = []
+        self.fuel_drain_secs: float = 3.0
+        self._fuel_drain_until: Dict[int, float] = {}  # idx → monotonic deadline
+
         # UI strings
         self.sc_status = "Inactive"
         self.slip_status = "Slip: Inactive"
@@ -1127,6 +1142,10 @@ class CustomScriptsController:
                 "range_seg": str(self.slip_range_seg),
                 "engine_mult": str(self.slip_engine_mult),
                 "hold_ms": str(self.slip_hold_ms),
+            },
+            "fuel_drain": {
+                "targets": list(self.fuel_drain_targets),
+                "secs":    float(self.fuel_drain_secs),
             },
         }
 
@@ -1178,6 +1197,13 @@ class CustomScriptsController:
             self.slip_range_seg = self._as_float(slip.get("range_seg", self.slip_range_seg), self.slip_range_seg)
             self.slip_engine_mult = self._as_float(slip.get("engine_mult", self.slip_engine_mult), self.slip_engine_mult)
             self.slip_hold_ms = self._as_float(slip.get("hold_ms", self.slip_hold_ms), self.slip_hold_ms)
+
+        fd = cfg.get("fuel_drain", {})
+        if isinstance(fd, dict):
+            raw_targets = fd.get("targets", self.fuel_drain_targets)
+            if isinstance(raw_targets, list):
+                self.fuel_drain_targets = [int(x) for x in raw_targets if str(x).strip().lstrip("-").isdigit()]
+            self.fuel_drain_secs = max(0.1, self._as_float(fd.get("secs", self.fuel_drain_secs), self.fuel_drain_secs))
 
     # ----- helpers -----
     def _read_u8(self, idx: int, struct_ofs: int) -> int:
@@ -1376,7 +1402,7 @@ class CustomScriptsController:
         self._update_range_labels()
 
     def update(self, now: float):
-        if not (self.sc_active or self.slip_active):
+        if not (self.sc_active or self.slip_active or self._fuel_drain_until):
             return
 
         if not self.app.pm or not self.app.enable_writes:
@@ -1584,6 +1610,42 @@ class CustomScriptsController:
                     except Exception:
                         pass
 
+        # ── Fuel drain ────────────────────────────────────────────────────────
+        if self._fuel_drain_until:
+            now_mono = time.monotonic()
+            done = []
+            for idx, deadline in list(self._fuel_drain_until.items()):
+                if now_mono >= deadline:
+                    done.append(idx)
+                    continue
+                try:
+                    self._write_u32(idx, OFS["fuelLoad"], 0)
+                except Exception:
+                    pass
+            for idx in done:
+                del self._fuel_drain_until[idx]
+
+    def fuel_drain_fire(self):
+        # Writes fuelLoad=0 in target cars during fuel_drain_secs seconds
+        if not self.app.pm:
+            return
+        if not self.app.enable_writes:
+            if msg_yesno("Enable writes?", "Fuel drain needs memory writes.\nEnable 'Enable writes' now?"):
+                self.app.set_enable_writes(True)
+            else:
+                return
+        targets = set(self.fuel_drain_targets)
+        if not targets:
+            return
+        deadline = time.monotonic() + max(0.1, float(self.fuel_drain_secs))
+        for idx in range(self.app.car_count):
+            try:
+                cid = int(self.app.pm.read_uchar(self.app.field_addr(idx, OFS["carId"])))
+                raw_id = cid - 128 if cid > 40 else cid
+                if raw_id in targets:
+                    self._fuel_drain_until[idx] = deadline
+            except Exception:
+                pass
 
 
 class GP2ViewerApp:
@@ -1598,6 +1660,52 @@ class GP2ViewerApp:
         self.sorted_cars: List[Dict] = []
         self.snap_by_index: Dict[int, Dict] = {}
         self.selected_index: Optional[int] = None
+        self.focused_car_index: Optional[int] = None
+
+        # JSON export
+        self.json_export_enabled: bool = False
+        self.json_export_folder: str = r""
+        self.ui_json_export_checkbox = None
+        self.ui_json_export_folder   = None
+        self.ui_json_export_status   = None
+
+        # ── Timing / sector state ──────────────────────────────────────────
+        # Main reference table: car_id -> best lap + sectors of that lap
+        # { car_id: { "best_lap": int, "s1": int, "s2": int, "s3": int } }
+        self._ref_table: Dict[int, Dict] = {}
+
+        # Global best per sector (across all drivers)
+        self._global_best_s1:  int = 0
+        self._global_best_s2:  int = 0
+        self._global_best_s3:  int = 0
+
+        # Track previous timeLast per car to detect lap completion
+        self._prev_time_last: Dict[int, int] = {}   # car_id -> timeLast seen last tick
+
+        # Track previous lapNr per car to detect out-lap (box exit)
+        self._prev_lap_nr: Dict[int, int] = {}       # car_id -> lapNr seen last tick
+
+        # Out-lap flag per car: True means current lap started from pits → ignore sectors
+        self._out_lap: Dict[int, bool] = {}
+
+        # Sectors of the current in-progress lap (updated at each split)
+        # car_id -> { "s1": int|None, "s2": int|None, "spl1": int, "spl2": int }
+        self._live_sectors: Dict[int, Dict] = {}
+
+        # Post-lap display window: car_id -> monotonic timestamp of crossing the line
+        self._post_lap_ts: Dict[int, float] = {}
+        self._last_completed: Dict[int, Dict] = {}
+        self.POST_LAP_SECS = 15.0
+
+        # Session clock at the moment each car last crossed the start/finish line
+        # raw_id -> session_clock_ms captured when lapNr changed
+        self._lap_start_session_ms: Dict[int, int] = {}
+
+        # ── Race gap state ─────────────────────────────────────────────────
+        self._race_track_length:     Optional[int]    = None
+        self._race_prev_leader_lap:  Optional[int]    = None
+        self._race_prev_leader_9e:   Optional[int]    = None
+        self._race_tick_counter:     int              = 0
 
         # config state (strings like old UI)
         self.process_name: str = DEFAULT_PROCESS_NAME
@@ -1702,6 +1810,531 @@ class GP2ViewerApp:
 
     def field_addr(self, car_index: int, struct_offset: int) -> int:
         return self.record_start_addr(car_index) + struct_offset
+
+    def read_focused_car_index(self) -> Optional[int]:
+        
+        # Returns the idx (0-25) of the car currently in camera focus,
+        # or None if it cannot be determined.
+
+        # The game stores the focused car in two mirrored addresses:
+        #     En_Foco_1 = base_anchor + EN_FOCO_OFFSET_1
+        #     En_Foco_2 = base_anchor + EN_FOCO_OFFSET_2
+
+        # The value stored is a linear mapping:
+        #     value = EN_FOCO_IDX0_VALUE + idx * record_size
+        # So:
+        #     idx = (value - EN_FOCO_IDX0_VALUE) // record_size
+        
+        if not self.pm or not self.base_anchor:
+            return None
+        try:
+            addr = (self.base_anchor + EN_FOCO_OFFSET_1) & 0xFFFFFFFF
+            value = self.pm.read_uint(addr)
+            idx = (value - EN_FOCO_IDX0_VALUE) // self.record_size
+            if 0 <= idx < self.car_count:
+                return idx
+        except Exception:
+            pass
+        # fallback: try second address
+        try:
+            addr = (self.base_anchor + EN_FOCO_OFFSET_2) & 0xFFFFFFFF
+            value = self.pm.read_uint(addr)
+            idx = (value - EN_FOCO_IDX0_VALUE) // self.record_size
+            if 0 <= idx < self.car_count:
+                return idx
+        except Exception:
+            pass
+        return None
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _fmt_time(self, raw: int) -> Optional[str]:
+        # Convert raw i32 game time to 'm:ss.mmm'. Returns None if zero/invalid.
+        if raw <= 0:
+            return None
+        ms = raw % 1000
+        s  = (raw // 1000) % 60
+        m  = raw // 60000
+        return f"{m}:{s:02d}.{ms:03d}"
+
+    def _fmt_gap(self, delta_ms: int) -> str:
+        # Format a gap in ms as '+s.mmm' or '-s.mmm'.
+        sign    = "+" if delta_ms >= 0 else "-"
+        abs_ms  = abs(delta_ms)
+        s_part  = abs_ms // 1000
+        ms_part = abs_ms % 1000
+        return f"{sign}{s_part}.{ms_part:03d}"
+
+    def _sector_color(self, val: int, personal_best: int, global_best: int,
+                      has_personal_ref: bool) -> str:
+        # 
+        # Color logic:
+        #   - val <= 0               → empty
+        #   - val <= global_best     → purple  (best of all, including ties)
+        #   - val < personal_best    → green   (personal best)
+        #   - no personal ref yet    → green   (first valid lap for this driver)
+        #   - otherwise              → yellow  (slower than personal best)
+        # 
+        if val <= 0:
+            return "empty"
+        if global_best > 0 and val <= global_best:
+            return "purple"
+        if not has_personal_ref:
+            return "green"
+        if personal_best > 0 and val < personal_best:
+            return "green"
+        return "yellow"
+
+    # All 26 raw driver IDs (used to pre-populate timing table on reset)
+    ALL_RAW_IDS = [33, 12, 26, 16, 36, 22, 14, 18, 31, 38, 13, 28, 34, 10, 27, 15, 30, 11, 23, 35, 19, 21, 29, 25, 20, 24]
+
+    def reset_timing_table(self):
+        # Reset all timing to initial state. Pre-populates table with all 26 drivers.# 
+        # Pre-populate ref_table with all drivers, no times yet
+        self._ref_table = {
+            raw_id: {"raw_id": raw_id, "best_lap": 0, "s1": 0, "s2": 0, "s3": 0}
+            for raw_id in self.ALL_RAW_IDS
+        }
+        self._global_best_s1   = 0
+        self._global_best_s2   = 0
+        self._global_best_s3   = 0
+        self._prev_time_last   = {}
+        self._prev_lap_nr      = {}
+        self._out_lap          = {}
+        self._live_sectors     = {}
+        self._post_lap_ts      = {}
+        self._last_completed   = {}
+        self._lap_start_session_ms = {}
+        self._race_track_length     = None
+        self._race_prev_leader_lap  = None
+        self._race_prev_leader_9e   = None
+        self._race_tick_counter     = 0
+
+    def _read_session_clock_ms(self) -> int:
+        # Read the session elapsed timer (ms, u32) from memory. Returns 0 on error.
+        if not self.pm or not self.base_anchor:
+            return 0
+        try:
+            addr = (self.base_anchor + SESSION_CLOCK_OFFSET) & 0xFFFFFFFF
+            return self.pm.read_uint(addr)
+        except Exception:
+            return 0
+
+    def _process_all_laps(self):
+        
+        # Called every refresh cycle. Scans all cars and updates _ref_table
+        # when any car completes a lap. Also detects out-laps.
+        # Key: always use raw_id (normalized) as the dict key, never raw car_id,
+        # to avoid duplicates when the player controls a car (car_id += 128).
+        
+        seen_raw_ids = set()
+        session_clock_ms = self._read_session_clock_ms()
+
+        # Pre-select best slot per raw_id: prefer the one with active data
+        best_slot: Dict[int, Dict] = {}
+        for d in self.sorted_cars:
+            car_id = d.get("carId", -1)
+            if car_id < 0:
+                continue
+            raw_id = car_id - 128 if car_id > 40 else car_id
+            if raw_id not in self.ALL_RAW_IDS:
+                continue
+            lap_nr_check = d.get("lapNr", 0)
+            last_check   = d.get("timeLast", 0)
+            if lap_nr_check == 0 and last_check == 0:
+                continue
+            # If we already have a slot for this raw_id, keep the one with more data
+            if raw_id in best_slot:
+                existing = best_slot[raw_id]
+                existing_score = (existing.get("timeLast", 0) > 0) + (existing.get("lapNr", 0) > 0)
+                new_score      = (last_check > 0) + (lap_nr_check > 0)
+                if new_score <= existing_score:
+                    continue
+            best_slot[raw_id] = d
+
+        for raw_id, d in best_slot.items():
+
+            lap_nr = d.get("lapNr", 0)
+            last   = d.get("timeLast",     0)
+            spl1   = d.get("timeLastSpl1", 0)
+            spl2   = d.get("timeLastSpl2", 0)
+
+            prev_lap  = self._prev_lap_nr.get(raw_id, -1)
+            prev_last = self._prev_time_last.get(raw_id, 0)
+
+            # Detect lap number change → car started a new lap
+            if prev_lap != -1 and lap_nr != prev_lap:
+                # out-lap = the lap that just completed was lap 0 (installation/formation)
+                self._out_lap[raw_id] = (prev_lap == 0)
+                # Capture session clock as the start of this new lap
+                if session_clock_ms > 0:
+                    self._lap_start_session_ms[raw_id] = session_clock_ms
+
+            # Detect lap completion: timeLast changed
+            lap_just_completed = (last > 0 and last != prev_last and prev_last > 0)
+
+            if lap_just_completed:
+                is_out_lap = self._out_lap.get(raw_id, False)
+
+                if not is_out_lap and spl1 > 0 and spl2 > spl1 and last > spl2:
+                    s1 = spl1
+                    s2 = spl2 - spl1
+                    s3 = last  - spl2
+
+                    # Update ref_table: keep personal best lap only
+                    entry = self._ref_table.get(raw_id, {})
+                    if entry.get("best_lap", 0) == 0 or last < entry["best_lap"]:
+                        self._ref_table[raw_id] = {
+                            "raw_id":   raw_id,
+                            "best_lap": last,
+                            "s1":       s1,
+                            "s2":       s2,
+                            "s3":       s3,
+                        }
+
+                    # Update global sector bests
+                    if self._global_best_s1 == 0 or s1 < self._global_best_s1:
+                        self._global_best_s1 = s1
+                    if self._global_best_s2 == 0 or s2 < self._global_best_s2:
+                        self._global_best_s2 = s2
+                    if self._global_best_s3 == 0 or s3 < self._global_best_s3:
+                        self._global_best_s3 = s3
+
+                    # Store for post-lap color display
+                    self._last_completed[raw_id] = {"s1": s1, "s2": s2, "s3": s3, "lap": last}
+
+                self._post_lap_ts[raw_id] = time.monotonic()
+                self._out_lap[raw_id] = False
+
+            # Only update tracking state if the slot has live data.
+            # If last==0 and we already have saved times, the car disappeared
+            # from the slot — preserve saved state, don't update tracking.
+            if last > 0 or raw_id not in self._ref_table or self._ref_table[raw_id].get("best_lap", 0) == 0:
+                self._prev_time_last[raw_id] = last
+                self._prev_lap_nr[raw_id]    = lap_nr
+
+            # Store live sector splits for this car (for timing table live columns)
+            if last > 0 or spl1 > 0:
+                split_nr_car = d.get("splitNr", 2)
+                self._live_sectors[raw_id] = {
+                    "split_nr": split_nr_car,
+                    "spl1":     spl1,
+                    "spl2":     spl2,
+                }
+
+    def _build_timing_table_json(self) -> list:
+        # Build the sorted timing table for the React overlay.
+        # Always returns all 26 drivers. Drivers without a time sort to the end.
+        # Includes live S1/S2 columns for the current in-progress lap.
+        rows = []
+        for raw_id in self.ALL_RAW_IDS:
+            entry   = self._ref_table.get(raw_id, {"raw_id": raw_id, "best_lap": 0, "s1": 0, "s2": 0, "s3": 0})
+            lap_ms  = entry.get("best_lap", 0)
+            pb_s1   = entry.get("s1", 0)
+            pb_s2   = entry.get("s2", 0)
+            pb_s3   = entry.get("s3", 0)
+            has_pb  = lap_ms > 0
+
+            # Live sector data for current lap
+            live    = self._live_sectors.get(raw_id, {})
+            split_nr = live.get("split_nr", 2)
+            spl1    = live.get("spl1", 0)
+            spl2    = live.get("spl2", 0)
+
+            # Live S1: visible when split_nr is 0 or 1
+            live_s1_ms    = spl1 if split_nr in (0, 1) and spl1 > 0 else 0
+            live_s2_ms    = (spl2 - spl1) if split_nr == 1 and spl2 > spl1 > 0 else 0
+            live_s1_color = self._sector_color(live_s1_ms, pb_s1, self._global_best_s1, has_pb) if live_s1_ms > 0 else "empty"
+            live_s2_color = self._sector_color(live_s2_ms, pb_s2, self._global_best_s2, has_pb) if live_s2_ms > 0 else "empty"
+
+            rows.append({
+                "raw_id":       raw_id,
+                "best_lap":     self._fmt_time(lap_ms),
+                "best_lap_ms":  lap_ms,
+                "s1":           self._fmt_time(pb_s1),
+                "s2":           self._fmt_time(pb_s2),
+                "s3":           self._fmt_time(pb_s3),
+                "s1_color":     self._sector_color(pb_s1, pb_s1, self._global_best_s1, has_pb) if has_pb else "empty",
+                "s2_color":     self._sector_color(pb_s2, pb_s2, self._global_best_s2, has_pb) if has_pb else "empty",
+                "s3_color":     self._sector_color(pb_s3, pb_s3, self._global_best_s3, has_pb) if has_pb else "empty",
+                "live_s1":      self._fmt_time(live_s1_ms),
+                "live_s2":      self._fmt_time(live_s2_ms),
+                "live_s1_color": live_s1_color,
+                "live_s2_color": live_s2_color,
+            })
+        # Sort: drivers with time first (ascending), without time at the end
+        rows.sort(key=lambda r: r["best_lap_ms"] if r["best_lap_ms"] > 0 else 10**9)
+        for i, r in enumerate(rows):
+            r["pos"] = i + 1
+        return rows
+
+    def _build_race_json(self) -> dict:
+        """Build race.json for the Race overlay.
+
+        Gap formula (stable, uses full-lap average speed):
+            vel  = track_length / timeLast_ms   (units/ms)
+            gap  = delta_field_9E / vel
+                 = delta_field_9E * timeLast_ms / track_length
+
+        track_length captured once when leader lap 1→2.
+        Gap only shown once track_length is known AND car has timeLast > 0.
+
+        OUT detection: field_9E frozen >10s outside pits AND not all cars frozen
+        (all-frozen means pause or pre-race — don't flag anyone OUT).
+        """
+        cars = self.sorted_cars
+        if not cars:
+            return {"cars": [], "leader_lap": 0, "track_length": 0}
+
+        session_clock = self._read_session_clock_ms()
+
+        # ── Capture track_length ───────────────────────────────────────────
+        # field_9E is cumulative. At any lap change N-1 → N, the delta of field_9E
+        # over the previous lap = exactly 1 track_length.
+        # We store field_9E at the previous lap change to compute the delta.
+        leader      = cars[0]
+        leader_lap  = int(leader.get("lapNr", 0) or 0)
+        prev_ll     = self._race_prev_leader_lap
+        leader_9e   = int(leader.get("field_9E", 0) or 0)
+
+        if self._race_track_length is None and prev_ll is not None and leader_lap > prev_ll and leader_lap >= 2:
+            prev_9e = self._race_prev_leader_9e
+            if prev_9e is not None and leader_9e > prev_9e:
+                # delta = exactly one lap of track distance
+                self._race_track_length = leader_9e - prev_9e
+            elif leader_lap == 2 and leader_9e > 0:
+                # First lap completed from scratch — field_9E = 1 × track_length
+                self._race_track_length = leader_9e
+
+        # Store field_9E at each lap change to compute delta next time
+        if prev_ll is not None and leader_lap > prev_ll:
+            self._race_prev_leader_9e = leader_9e
+
+        self._race_prev_leader_lap = leader_lap
+
+        track_length = self._race_track_length
+
+        # ── OUT detection: bit 7 of flags_90 = car invisible = out of race ──
+        # ── Build rows ─────────────────────────────────────────────────────
+        rows = []
+        for i, d in enumerate(cars):
+            car_id  = int(d.get("carId", 0) or 0)
+            raw_id  = car_id - 128 if car_id > 40 else car_id
+            pos     = int(d.get("place_sorted", 0) or 0)
+            lap     = int(d.get("lapNr", 0) or 0)
+            in_pits = bool(d.get("in_pits_guess", False))
+            pos9e   = int(d.get("field_9E", 0) or 0)
+            time_last_raw = int(d.get("timeLast", 0) or 0)
+            time_last_ms  = time_last_raw & 0x0FFFFFFF if time_last_raw > 0 else 0
+
+            is_out  = bool(d.get("is_invisible", False))
+
+            gap_ms  = 0
+            gap_str = ""
+
+            if pos > 1 and track_length and i > 0 and not is_out:
+                ahead    = cars[i - 1]
+                ahead_9e = int(ahead.get("field_9E", 0) or 0)
+                delta    = max(0, ahead_9e - pos9e)
+
+                if time_last_ms > 0 and delta >= 0:
+                    # gap = delta_units * timeLast / track_length
+                    gap_ms  = int(delta * time_last_ms / track_length)
+                    mins    = gap_ms // 60000
+                    secs    = (gap_ms % 60000) / 1000.0
+                    if mins > 0:
+                        gap_str = f"+{mins}:{secs:06.3f}"
+                    else:
+                        gap_str = f"+{secs:.3f}"
+
+            rows.append({
+                "car_id":  raw_id,
+                "pos":     pos,
+                "lap":     lap,
+                "gap_str": gap_str,
+                "gap_ms":  gap_ms,
+                "in_pits": in_pits,
+                "is_out":  is_out,
+            })
+
+        return {
+            "cars":         rows,
+            "leader_lap":   leader_lap,
+            "track_length": track_length or 0,
+        }
+
+    def export_focused_car_json(self):
+        # Write focused_car.json, sector_times.json, timing_table.json, race.json.
+        if not self.json_export_enabled:
+            return
+        try:
+            now = time.monotonic()
+
+            # Process all cars first (lap completions, out-laps, sector updates)
+            self._process_all_laps()
+
+            focused_idx = self.focused_car_index
+            snap        = self.snap_by_index.get(focused_idx) if focused_idx is not None else None
+
+            # ── focused_car.json ──────────────────────────────────────────
+            if snap is None:
+                focused_data = {"focused": False}
+            else:
+                focused_data = {
+                    "focused":      True,
+                    "car_id":       snap.get("carId"),
+                    "idx":          focused_idx,
+                    "position":     snap.get("place_sorted"),
+                    "lap":          snap.get("lapNr"),
+                    "kph":          round(snap.get("kph", 0.0), 2),
+                    "gear":         snap.get("gear"),
+                    "revs":         snap.get("revs"),
+                    "throttle_pct": round(snap.get("throttle_pct", 0.0), 1),
+                }
+
+            # ── sector_times.json ─────────────────────────────────────────
+            if snap is None:
+                sector_data = {"focused": False}
+            else:
+                car_id   = snap.get("carId", -1)
+                raw_id   = car_id - 128 if car_id > 40 else car_id
+                split_nr = snap.get("splitNr", 2)
+                spl1     = snap.get("timeLastSpl1", 0)
+                spl2     = snap.get("timeLastSpl2", 0)
+                last     = snap.get("timeLast",     0)
+
+                is_out_lap   = self._out_lap.get(raw_id, False) or (last == 0)
+                post_ts      = self._post_lap_ts.get(raw_id, 0)
+                in_post_lap  = (post_ts > 0 and (now - post_ts) < self.POST_LAP_SECS)
+                # Can't be in post-lap if it's an out-lap
+                if is_out_lap:
+                    in_post_lap = False
+
+                # Personal best from ref table
+                pb_entry = self._ref_table.get(raw_id, {})
+                pb_s1    = pb_entry.get("s1",  0)
+                pb_s2    = pb_entry.get("s2",  0)
+                pb_s3    = pb_entry.get("s3",  0)
+                pb_lap   = pb_entry.get("best_lap", 0)
+                has_pb   = pb_lap > 0
+
+                # Timing table sorted → P1 is leader
+                table    = self._build_timing_table_json()
+                leader   = table[0] if table else None
+                leader_s1  = leader["s1"]   if leader else None  # formatted string
+                leader_s2  = leader["s2"]   if leader else None
+                leader_lap_ms = leader["best_lap_ms"] if leader else 0
+
+                # Position of focused driver in timing table
+                focused_pos = next(
+                    (r["pos"] for r in table if r["raw_id"] == raw_id), None
+                )
+
+                # ── GAP calculation ───────────────────────────────────────
+                # E1 (split_nr=2): no gap
+                # E2 (split_nr=0, S1 done): gap = cur_s1 vs leader_s1_ms
+                # E3 (split_nr=1, S1+S2 done): gap = (cur_s1+cur_s2) vs leader_(s1+s2)_ms
+                # E4 (post_lap): gap = pb_lap vs leader_lap
+                gap_str = None
+                gap_ms  = None
+
+                if in_post_lap and leader_lap_ms > 0:
+                    # Use the lap that JUST completed, not the personal best
+                    last_completed_lap = self._last_completed.get(raw_id, {}).get("lap", 0)
+                    if last_completed_lap > 0:
+                        gap_ms  = last_completed_lap - leader_lap_ms
+                        gap_str = self._fmt_gap(gap_ms)
+
+                elif not in_post_lap and not is_out_lap and leader:
+                    leader_s1_ms = leader.get("s1_ms", 0)
+                    leader_s2_ms = leader.get("s2_ms", 0)
+                    # We need raw ms from ref table for leader
+                    leader_entry = self._ref_table.get(leader["raw_id"], {})
+                    ls1_ms = leader_entry.get("s1", 0)
+                    ls2_ms = leader_entry.get("s2", 0)
+
+                    if split_nr == 0 and spl1 > 0 and ls1_ms > 0:
+                        gap_ms  = spl1 - ls1_ms
+                        gap_str = self._fmt_gap(gap_ms)
+                    elif split_nr == 1 and spl2 > 0 and ls1_ms > 0 and ls2_ms > 0:
+                        cur_s1s2    = spl2
+                        leader_s1s2 = ls1_ms + ls2_ms
+                        gap_ms  = cur_s1s2 - leader_s1s2
+                        gap_str = self._fmt_gap(gap_ms)
+
+                # ── Sector colors ─────────────────────────────────────────
+                if in_post_lap:
+                    # Colors of the lap that just completed
+                    post_entry = self._last_completed.get(raw_id, {})
+                    lc_s1 = post_entry.get("s1", 0)
+                    lc_s2 = post_entry.get("s2", 0)
+                    lc_s3 = post_entry.get("s3", 0)
+                    c1 = self._sector_color(lc_s1, pb_s1, self._global_best_s1, has_pb)
+                    c2 = self._sector_color(lc_s2, pb_s2, self._global_best_s2, has_pb)
+                    c3 = self._sector_color(lc_s3, pb_s3, self._global_best_s3, has_pb)
+                elif is_out_lap:
+                    c1 = c2 = c3 = "empty"
+                else:
+                    # Live: color sectors as they complete
+                    c1 = "empty"
+                    c2 = "empty"
+                    c3 = "empty"
+                    if split_nr in (0, 1) and spl1 > 0:
+                        c1 = self._sector_color(spl1, pb_s1, self._global_best_s1, has_pb)
+                    if split_nr == 1 and spl2 > spl1 > 0:
+                        cur_s2 = spl2 - spl1
+                        c2 = self._sector_color(cur_s2, pb_s2, self._global_best_s2, has_pb)
+
+                sector_data = {
+                    "focused":          True,
+                    "car_id":           raw_id,
+                    "position":         focused_pos,
+                    "split_nr":         split_nr,
+                    "in_post_lap":      in_post_lap,
+                    "is_out_lap":       is_out_lap,
+                    "gap_str":          gap_str,
+                    "gap_ms":           gap_ms,
+                    "s1_color":         c1,
+                    "s2_color":         c2,
+                    "s3_color":         c3,
+                    "last_lap_str":     self._fmt_time(last),
+                    "session_clock_ms": self._read_session_clock_ms(),
+                    "lap_start_ms":     self._lap_start_session_ms.get(raw_id, 0),
+                }
+
+            # ── timing_table.json ─────────────────────────────────────────
+            table_data = {
+                "table": self._build_timing_table_json(),
+                "global_best_s1": self._fmt_time(self._global_best_s1),
+                "global_best_s2": self._fmt_time(self._global_best_s2),
+                "global_best_s3": self._fmt_time(self._global_best_s3),
+            }
+
+            # Write qualy/practice files every tick
+            for filename, data in [
+                ("focused_car.json",   focused_data),
+                ("sector_times.json",  sector_data),
+                ("timing_table.json",  table_data),
+            ]:
+                path = os.path.join(self.json_export_folder, filename)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+
+            # Write race.json every 5 ticks (gap calc doesn't need sub-second updates)
+            self._race_tick_counter += 1
+            if self._race_tick_counter >= 5:
+                self._race_tick_counter = 0
+                race_data = self._build_race_json()
+                path = os.path.join(self.json_export_folder, "race.json")
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(race_data, f, indent=2)
+
+            if self.ui_json_export_status is not None:
+                dpg.set_value(self.ui_json_export_status, f"OK → {self.json_export_folder}")
+
+        except Exception as e:
+            if self.ui_json_export_status is not None:
+                dpg.set_value(self.ui_json_export_status, f"Error: {e}")
 
     def write_field_bytes(self, car_index: int, struct_offset: int, payload: bytes):
         if struct_offset < 0 or struct_offset + len(payload) > self.record_size:
@@ -1837,6 +2470,18 @@ class GP2ViewerApp:
 
         d["carId"] = u8(OFS["carId"])
 
+        d["splitNr"]      = u8(OFS["splitNr"])
+        d["timeLastSpl1"] = i32(OFS["timeLastSpl1"])
+        d["timeLastSpl2"] = i32(OFS["timeLastSpl2"])
+        d["timeLast"]     = i32(OFS["timeLast"])
+        d["timeBestSpl1"] = i32(OFS["timeBestSpl1"])
+        d["timeBestSpl2"] = i32(OFS["timeBestSpl2"])
+        d["timeBest"]     = i32(OFS["timeBest"])
+        d["timeLapStart"]  = u32(OFS["timeLapStart"])
+        d["in_pits_guess"] = bool(u8(OFS["flags_23"]) & (1 << 5))
+        d["field_9E"]      = i32(OFS["field_9E"])
+        d["is_invisible"]  = bool(u8(OFS["flags_90"]) & (1 << 7))
+
         speed_raw = u32(OFS["speed_raw_u32"])
         d["speed_raw"] = speed_raw
         d["kph"] = speed_raw / SPEED_RAW_PER_KPH if speed_raw else 0.0
@@ -1921,6 +2566,9 @@ class GP2ViewerApp:
         self.sorted_cars = cars
         self.snap_by_index = {d["index"]: d for d in cars}
 
+        # Read focused car once per refresh cycle
+        self.focused_car_index = self.read_focused_car_index()
+
     def _render_overview(self):
         if self.ov_table is None:
             return
@@ -1939,6 +2587,7 @@ class GP2ViewerApp:
                 continue
 
             values = [
+                ">>>" if d.get("index") == self.focused_car_index else "",
                 ordinal(d.get("place_sorted", 9999)),
                 ordinal(d.get("racePos_place", None)),
                 str(d.get("racePos_raw", "")),
@@ -1990,6 +2639,7 @@ class GP2ViewerApp:
             self.scripts.tick_snapshot(self.sorted_cars)
             self._render_overview()
             self._render_details()
+            self.export_focused_car_json()
         except Exception as e:
             self._set_status(f"Refresh failed: {e}")
             self.stop_auto_refresh()
@@ -2313,6 +2963,13 @@ class GP2ViewerApp:
             dpg.set_value(self._scripts_ui_ids["seen_range"], self.scripts.seen_range)
         if "locked_range" in self._scripts_ui_ids:
             dpg.set_value(self._scripts_ui_ids["locked_range"], self.scripts.locked_range)
+        if "fd_status" in self._scripts_ui_ids:
+            pending = len(self.scripts._fuel_drain_until)
+            total   = len(self.scripts.fuel_drain_targets)
+            if pending:
+                dpg.set_value(self._scripts_ui_ids["fd_status"], f"Drenando: {pending} autos activos...")
+            else:
+                dpg.set_value(self._scripts_ui_ids["fd_status"], f"Listo — {total} autos configurados")
 
     def _build_scripts_ui(self, parent):
         with dpg.group(parent=parent):
@@ -2446,8 +3103,88 @@ class GP2ViewerApp:
                         dpg.add_button(label="Slip ON", callback=lambda *_: (self.scripts.slip_on(), self._sync_scripts_status_ui()))
                         dpg.add_button(label="Slip OFF", callback=lambda *_: (self.scripts.slip_off(), self._sync_scripts_status_ui()))
 
+                with dpg.tab(label="Fuel Drain"):
+                    dpg.add_text("Escribe fuelLoad=0 durante N segundos en los autos indicados.")
+                    dpg.add_separator()
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Targets (car_ids, ej: 36 22 28):")
+                    self._scripts_ui_ids["fd_targets"] = dpg.add_input_text(
+                        default_value=" ".join(str(x) for x in self.scripts.fuel_drain_targets),
+                        width=300,
+                        hint="ej: 36 22 28",
+                        callback=lambda s, a, u: self._on_fd_targets_change(a),
+                    )
+                    dpg.add_separator()
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Duración (seg):")
+                        dpg.add_input_float(
+                            default_value=float(self.scripts.fuel_drain_secs),
+                            width=100,
+                            min_value=0.1,
+                            max_value=60.0,
+                            callback=lambda s, a, u: self._set_script_attr("fuel_drain_secs", float(a)),
+                        )
+                    dpg.add_separator()
+                    self._scripts_ui_ids["fd_status"] = dpg.add_text(
+                        f"Listo — {len(self.scripts.fuel_drain_targets)} autos configurados"
+                    )
+                    dpg.add_button(
+                        label="▶ FIRE",
+                        callback=lambda *_: (self.scripts.fuel_drain_fire(), self._sync_scripts_status_ui()),
+                    )
+
+    def _do_reset_timing(self):
+        """Reset timing table and immediately write the empty table to JSON."""
+        self.reset_timing_table()
+        if not self.json_export_enabled:
+            return
+        try:
+            table_data = {
+                "table": self._build_timing_table_json(),
+                "global_best_s1": None,
+                "global_best_s2": None,
+                "global_best_s3": None,
+            }
+            path = os.path.join(self.json_export_folder, "timing_table.json")
+            with open(path, "w", encoding="utf-8") as f:
+                import json as _json
+                _json.dump(table_data, f, indent=2)
+            if self.ui_json_export_status is not None:
+                dpg.set_value(self.ui_json_export_status, "Timing reset OK")
+        except Exception as e:
+            if self.ui_json_export_status is not None:
+                dpg.set_value(self.ui_json_export_status, f"Reset error: {e}")
+
+    def _browse_export_folder(self):
+        """Open a native Windows folder picker and update the export folder."""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            folder = filedialog.askdirectory(initialdir=self.json_export_folder, title="Select export folder")
+            root.destroy()
+            if folder:
+                self.json_export_folder = folder
+                if self.ui_json_export_folder is not None:
+                    dpg.set_value(self.ui_json_export_folder, folder)
+        except Exception as e:
+            msg_error("Folder picker", str(e))
+
     def _set_script_attr(self, name: str, value: Any):
         setattr(self.scripts, name, value)
+        self.schedule_save_config()
+        self._sync_scripts_status_ui()
+
+    def _on_fd_targets_change(self, text: str):
+        targets = []
+        for tok in text.replace(",", " ").split():
+            try:
+                targets.append(int(tok))
+            except ValueError:
+                pass
+        self.scripts.fuel_drain_targets = targets
         self.schedule_save_config()
         self._sync_scripts_status_ui()
 
@@ -2502,6 +3239,23 @@ class GP2ViewerApp:
                 dpg.add_button(label="Start Auto", callback=lambda *_: self.start_auto_refresh())
                 dpg.add_button(label="Stop Auto", callback=lambda *_: self.stop_auto_refresh())
 
+            # JSON export row
+            with dpg.group(horizontal=True):
+                self.ui_json_export_checkbox = dpg.add_checkbox(
+                    label="Export focused_car.json",
+                    default_value=bool(self.json_export_enabled),
+                    callback=lambda s, a, u: setattr(self, "json_export_enabled", bool(a)),
+                )
+                dpg.add_text("Folder:")
+                self.ui_json_export_folder = dpg.add_input_text(
+                    default_value=self.json_export_folder,
+                    width=400,
+                    callback=lambda s, a, u: setattr(self, "json_export_folder", str(a).strip() or "."),
+                )
+                dpg.add_button(label="Browse", callback=lambda *_: self._browse_export_folder())
+                dpg.add_button(label="Reset Timing", callback=lambda *_: self._do_reset_timing())
+                self.ui_json_export_status = dpg.add_text("—")
+
             dpg.add_separator()
             # Main content area (leaves space for footer)
             with dpg.child_window(border=False, height=-FOOTER_H-8,  no_scrollbar=True,no_scroll_with_mouse=True,):
@@ -2543,7 +3297,7 @@ class GP2ViewerApp:
             height=-1,
         )
 
-        cols = ["Sel", "Pos", "PosR", "racePos", "PosB", "CarId", "Idx", "Lap", "csIdx", "SegF", "kph", "Gear", "Revs", "Thr%", "Fuel", "Pit", "Damage"]
+        cols = ["Sel", "Foco", "Pos", "PosR", "racePos", "PosB", "CarId", "Idx", "Lap", "csIdx", "SegF", "kph", "Gear", "Revs", "Thr%", "Fuel", "Pit", "Damage"]
         for c in cols:
             dpg.add_table_column(label=c, parent=self.ov_table)
 
