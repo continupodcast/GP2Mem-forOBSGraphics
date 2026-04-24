@@ -1,3 +1,48 @@
+## What's diferent in this version
+
+This is a fork of [ilya-ssh/GP2Mem](https://github.com/ilya-ssh/GP2Mem) extended with real-time JSON export, timing engine, and additional tooling for live broadcast overlays.
+
+---
+
+## 1. JSON Export
+
+Four files are now exported in real time to a configurable folder:
+
+- **`focused_car.json`** — position, lap, speed, gear, revs and throttle of the car currently on camera
+- **`sector_times.json`** — sector splits, colors (purple/green/yellow), gap to leader, post-lap window and out-lap detection for the focused car
+- **`timing_table.json`** — full 26-driver timing table sorted by best lap, including personal and global sector bests and live S1/S2 columns for the current in-progress lap
+- **`race.json`** — race order with gap to car ahead in real time, pit status, and retirement detection
+
+The export folder is configured directly from the UI via a native Windows folder picker. A **Reset Timing** button clears all accumulated timing data — useful before qualifying and practice sessions.
+
+---
+
+## 2. Fuel Drain Script
+
+You can use it to "eliminate" extra cars before the race if your F1 season doesn't have as much as 13 teams. The fuel drain duration is now configured in **seconds** (float, max 60s). The deadline is calculated using `time.monotonic()`, making the drain time consistent regardless of the game's refresh rate. Additionally, if memory writes are not enabled when firing, the script now prompts the user to enable them on the spot instead of silently doing nothing.
+
+---
+
+## 3. Focused Car Detection
+
+GP2Mem now reads which car is currently on camera from two mirrored memory addresses. The focused car index is updated every refresh cycle and used to populate `focused_car.json` and `sector_times.json`. If the primary address fails, it falls back to the secondary one automatically.
+
+---
+
+## 4. Main Table — New Columns
+
+The car table now includes the following additional columns:
+
+- **Foco** — marks which car is currently in camera focus
+- **splitNr** — current sector the car is in (0, 1 or 2)
+- **timeLastSpl1 / timeLastSpl2** — raw split times from the last lap
+- **timeLast / timeBest** — last lap and personal best lap times
+- **field_9E** — cumulative track position field used for gap calculation
+- **in_pits** — pit lane detection flag
+- **is_invisible** — retirement/out-of-race detection flag
+
+
+This is the OG Description
 # Disclaimer
 
 GP2Mem edits the memory of a running process. It can cause crashes, corrupted game state, or unexpected behavior. Use at your own risk.
@@ -106,5 +151,8 @@ If you want to donate something (not encouraged but appreciated), you can do so 
 
 - Ethereum: `0xE85984123B0449e6EFDC7FcaF28FFa9731868799`
 - Bitcoin: `bc1qgkkfx6ef69avp5d6fkx7v606j9g8vsdtz7cwaw`
+
+
+
 
 
